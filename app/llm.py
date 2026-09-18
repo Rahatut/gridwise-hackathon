@@ -1,111 +1,148 @@
 """
-LLM operator-note interpreter.
+LLM operator-note interpreter using the official Google Gemini API (google-genai).
 
-Architecture boundary (Section I of refactor spec):
+Architecture boundary:
     interpret_operator_notes(operator_notes, battery_context)
         -> List[DirectiveInterpretation]
 
-The LLM returns raw JSON; deterministic guardrails normalise it into
-canonical DirectiveInterpretation objects before the optimizer sees it.
-
-NOTE: This module uses OpenAI / OpenRouter as the LLM provider.
-A separate agent will migrate the _call_llm implementation to Gemini.
-The public interface (interpret_operator_notes) must not change.
+The LLM produces structured output via SDK response_schema; deterministic guardrails
+validate the output against canonical rules and battery context before the optimizer sees it.
 """
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from pydantic import BaseModel, Field
 
+from app.gemini_provider import LLMProviderError, generate_content_with_failover
 from app.models import BatterySpec, DirectiveInterpretation
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
-# System prompt — aligned with canonical Section 04 directive types
+# Structured Output Models for Gemini SDK
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are an energy operator directive parser for a 24-hour battery scheduling system.
-Hours are integers 0-23. Time windows are start-inclusive, end-exclusive.
+DirectiveTypeLiteral = Literal[
+    "solar_reduction",
+    "minimum_battery_reserve",
+    "no_charge_window",
+    "no_discharge_window",
+    "max_grid_window",
+    "no_op",
+]
 
-Parse each operator note into exactly one of these directive types:
-- solar_reduction: Reduce usable solar during specific hours.
-    structured_adjustment: {"hours": [...], "factor": <float 0-1>}
-    factor = usable fraction REMAINING (e.g., 80% reduction -> factor=0.2)
-- minimum_battery_reserve: Keep battery energy >= a required level during hours.
-    structured_adjustment: {"hours": [...], "minimum_energy_kwh": <float>}
-- no_charge_window: Forbid battery charging during specific hours.
-    structured_adjustment: {"hours": [...]}
-- no_discharge_window: Forbid battery discharging during specific hours.
-    structured_adjustment: {"hours": [...]}
-- max_grid_window: Cap grid import during specific hours.
-    structured_adjustment: {"hours": [...], "max_grid_kwh": <float>}
-- no_op: The note does not affect the current 24-hour energy schedule.
-    structured_adjustment: null, applies: false
 
-Rules:
-- If a directive does not apply, set directive_type="no_op", applies=false, structured_adjustment=null.
-- If it applies, set applies=true and include the correct structured_adjustment.
-- Time windows must be unique integers 0-23 in ascending order.
-- For solar_reduction, factor is the usable fraction REMAINING (e.g., 80% reduction means factor=0.2).
-- Every hours array must contain unique integers from 0 through 23 in ascending order.
-- Return ONLY valid JSON: an array of objects with keys:
-    note_index, directive_type, applies, structured_adjustment, explanation
+class StructuredAdjustment(BaseModel):
+    hours: Optional[List[int]] = Field(
+        default=None,
+        description="List of integer hours 0..23 during which the directive applies (start-inclusive, end-exclusive).",
+    )
+    factor: Optional[float] = Field(
+        default=None,
+        description="Usable solar fraction remaining (0.0 to 1.0) for solar_reduction. E.g. 80% reduction -> factor 0.20.",
+    )
+    minimum_energy_kwh: Optional[float] = Field(
+        default=None,
+        description="Required minimum stored battery energy in kWh for minimum_battery_reserve. Convert any percentage using battery capacity.",
+    )
+    max_grid_kwh: Optional[float] = Field(
+        default=None,
+        description="Maximum permitted grid import in kWh per hour for max_grid_window.",
+    )
+
+
+class RawDirectiveInterpretation(BaseModel):
+    note_index: int = Field(
+        description="Zero-based index of the corresponding operator note (0 to N-1).",
+    )
+    applies: bool = Field(
+        description="True if directive applies to 24h schedule constraints; False only for no_op.",
+    )
+    directive_type: DirectiveTypeLiteral = Field(
+        description="Canonical directive type: solar_reduction, minimum_battery_reserve, no_charge_window, no_discharge_window, max_grid_window, or no_op.",
+    )
+    structured_adjustment: Optional[StructuredAdjustment] = Field(
+        default=None,
+        description="Adjustment payload for applicable directives; null for no_op.",
+    )
+    explanation: str = Field(
+        description="Brief concise rationale for the interpretation.",
+    )
+
+
+class InterpretationsResponse(BaseModel):
+    interpretations: List[RawDirectiveInterpretation] = Field(
+        description="List containing exactly one interpretation per input note, in note_index order.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Semantic System Instruction
+# ---------------------------------------------------------------------------
+
+SYSTEM_INSTRUCTION = """You are an expert energy scheduling operator directive interpreter for a 24-hour campus microgrid system.
+Your job is to interpret natural-language operator notes into precise, structured energy constraints.
+
+Rules and conventions:
+1. Return exactly one interpretation per input note, preserving its note_index (0 to N-1).
+2. Time windows are start-inclusive, end-exclusive integer hours from 0 through 23 in strictly ascending order:
+   - "noon to 2 PM" -> hours [12, 13]
+   - "6 PM until 9 PM" / "6 PM to 9 PM" -> hours [18, 19, 20]
+   - "2 AM to 5 AM" -> hours [2, 3, 4]
+   - "6 PM to 8 PM" -> hours [18, 19]
+   - "11 AM to 2 PM" -> hours [11, 12, 13]
+   - Noon is hour 12; Midnight is hour 0.
+3. Supported directives only:
+   - solar_reduction: usable solar generation is reduced. factor is the USABLE FRACTION REMAINING (0.0 to 1.0).
+     * "80% reduction" -> factor = 0.20
+     * "25% of forecast remains" / "25% solar" -> factor = 0.25
+     * "solar reduced by 50%" -> factor = 0.50
+   - minimum_battery_reserve: keep battery energy >= minimum_energy_kwh during specified hours.
+     * When expressed as a percentage of battery capacity, compute numeric kWh using the provided battery capacity_kwh.
+     * Example: for a 200 kWh battery, "Keep at least 50% of battery capacity" -> minimum_energy_kwh = 100.0.
+   - no_charge_window: battery must not charge during specified hours. structured_adjustment contains {"hours": [...]}.
+   - no_discharge_window: battery must not discharge during specified hours. structured_adjustment contains {"hours": [...]}.
+   - max_grid_window: grid import must not exceed max_grid_kwh during specified hours.
+   - no_op: any note that is purely administrative, general commentary, maintenance notices without schedule impact, or irrelevant.
+4. Exact semantics:
+   - For "no_op": applies MUST be false, structured_adjustment MUST be null.
+   - For every other directive: applies MUST be true, structured_adjustment MUST have non-empty unique sorted hours and the required field.
+5. Do NOT invent demand profiles, tariff values, solar numbers, or unsupported directive types.
 """
 
 
-# ---------------------------------------------------------------------------
-# LLM call (provider: OpenAI / OpenRouter) — do NOT redesign this section
-# ---------------------------------------------------------------------------
-
-def _call_llm(notes: List[str]) -> List[Dict[str, Any]]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not set")
-
-    # Support OpenRouter keys (sk-or-v1-...) and direct OpenAI keys
-    if api_key.startswith("sk-or-v1-"):
-        client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
-        model = os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini")
-    else:
-        client = OpenAI(api_key=api_key)
-        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-    payload = [{"note_index": i, "note": n} for i, n in enumerate(notes)]
-    user_content = json.dumps(payload)
-
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.0,
-        timeout=25,
-    )
-
-    raw = resp.choices[0].message.content
-    parsed = json.loads(raw)
-    if isinstance(parsed, dict):
-        # LLM may wrap the array; unwrap common keys
-        for key in ("directives", "results", "items", "interpretations"):
-            if key in parsed and isinstance(parsed[key], list):
-                parsed = parsed[key]
-                break
-    return parsed  # type: ignore[return-value]
+def build_user_prompt(notes: List[str], battery: BatterySpec) -> str:
+    """Format operator notes with explicit indexes and battery metadata."""
+    lines = [
+        "Battery Context:",
+        f"- capacity_kwh: {battery.capacity_kwh}",
+        f"- initial_energy_kwh: {battery.initial_energy_kwh}",
+        f"- minimum_energy_kwh: {battery.minimum_energy_kwh}",
+        f"- max_charge_kwh_per_hour: {battery.max_charge_kwh_per_hour}",
+        f"- max_discharge_kwh_per_hour: {battery.max_discharge_kwh_per_hour}",
+        "",
+        f"Operator Notes to interpret ({len(notes)} notes):",
+    ]
+    for idx, note in enumerate(notes):
+        lines.append(f"[{idx}] {note}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Deterministic guardrails
+# Deterministic Guardrails & Canonical Validation
 # ---------------------------------------------------------------------------
 
-VALID_TYPES = {
+VALID_DIRECTIVE_TYPES = {
     "solar_reduction",
     "minimum_battery_reserve",
     "no_charge_window",
@@ -115,165 +152,315 @@ VALID_TYPES = {
 }
 
 
-def _make_no_op(idx: int, explanation: str = "No energy schedule impact.") -> DirectiveInterpretation:
-    return DirectiveInterpretation(
-        note_index=idx,
-        applies=False,
-        directive_type="no_op",
-        structured_adjustment=None,
-        explanation=explanation,
-    )
+def _validate_and_canonicalize(
+    raw_directives: List[RawDirectiveInterpretation],
+    num_notes: int,
+    battery: BatterySpec,
+) -> Tuple[bool, List[str], List[DirectiveInterpretation]]:
+    """
+    Validate raw directives against strict deterministic guardrails.
+    Returns (is_valid, list_of_error_strings, canonical_directives).
+    """
+    errors: List[str] = []
 
-
-def _guardrail(item: Dict[str, Any], idx: int) -> DirectiveInterpretation:
-    """Validate one raw LLM item and return a canonical DirectiveInterpretation."""
-    note_index = int(item.get("note_index", idx))
-    dtype = item.get("directive_type") or item.get("type")  # tolerate old key name
-    applies = item.get("applies", False)
-    adj = item.get("structured_adjustment")
-    explanation = str(item.get("explanation", "")).strip() or "Parsed by LLM."
-
-    if dtype not in VALID_TYPES:
-        return _make_no_op(note_index, "Invalid directive type from LLM; treated as no_op.")
-
-    if dtype == "no_op" or not applies:
-        return _make_no_op(note_index, explanation)
-
-    if not isinstance(adj, dict):
-        return _make_no_op(note_index, "Missing structured_adjustment; treated as no_op.")
-
-    # -- solar_reduction --
-    if dtype == "solar_reduction":
-        hours = _clean_hours(adj.get("hours"))
-        factor = adj.get("factor")
-        if hours is None:
-            return _make_no_op(note_index, "solar_reduction missing valid hours; treated as no_op.")
-        if not isinstance(factor, (int, float)) or not (0.0 <= factor <= 1.0):
-            return _make_no_op(note_index, "solar_reduction factor out of range; treated as no_op.")
-        return DirectiveInterpretation(
-            note_index=note_index,
-            applies=True,
-            directive_type="solar_reduction",
-            structured_adjustment={"hours": hours, "factor": float(factor)},
-            explanation=explanation,
+    if len(raw_directives) != num_notes:
+        errors.append(
+            f"Expected {num_notes} interpretations, but got {len(raw_directives)}."
         )
 
-    # -- minimum_battery_reserve --
-    if dtype == "minimum_battery_reserve":
-        hours = _clean_hours(adj.get("hours"))
-        # Accept both canonical key and legacy key from old prompt
-        reserve = adj.get("minimum_energy_kwh") or adj.get("reserve_kwh")
-        if hours is None:
-            return _make_no_op(note_index, "minimum_battery_reserve missing valid hours; treated as no_op.")
-        if not isinstance(reserve, (int, float)) or reserve < 0:
-            return _make_no_op(note_index, "minimum_battery_reserve invalid value; treated as no_op.")
-        return DirectiveInterpretation(
-            note_index=note_index,
-            applies=True,
-            directive_type="minimum_battery_reserve",
-            structured_adjustment={"hours": hours, "minimum_energy_kwh": float(reserve)},
-            explanation=explanation,
-        )
+    seen_indexes = set()
+    for item in raw_directives:
+        if item.note_index in seen_indexes:
+            errors.append(f"Duplicate note_index: {item.note_index}.")
+        seen_indexes.add(item.note_index)
 
-    # -- no_charge_window / no_discharge_window --
-    if dtype in ("no_charge_window", "no_discharge_window"):
-        hours = _clean_hours(adj.get("hours"))
-        if hours is None:
-            return _make_no_op(note_index, f"{dtype} missing valid hours; treated as no_op.")
-        return DirectiveInterpretation(
-            note_index=note_index,
-            applies=True,
-            directive_type=dtype,  # type: ignore[arg-type]
-            structured_adjustment={"hours": hours},
-            explanation=explanation,
-        )
+    expected_indexes = set(range(num_notes))
+    if seen_indexes != expected_indexes:
+        missing = expected_indexes - seen_indexes
+        extra = seen_indexes - expected_indexes
+        if missing:
+            errors.append(f"Missing note_index: {sorted(missing)}.")
+        if extra:
+            errors.append(f"Unexpected extra note_index: {sorted(extra)}.")
 
-    # -- max_grid_window --
-    if dtype == "max_grid_window":
-        hours = _clean_hours(adj.get("hours"))
-        max_grid = adj.get("max_grid_kwh")
-        if hours is None:
-            return _make_no_op(note_index, "max_grid_window missing valid hours; treated as no_op.")
-        if not isinstance(max_grid, (int, float)) or max_grid < 0:
-            return _make_no_op(note_index, "max_grid_window invalid max_grid_kwh; treated as no_op.")
-        return DirectiveInterpretation(
-            note_index=note_index,
-            applies=True,
-            directive_type="max_grid_window",
-            structured_adjustment={"hours": hours, "max_grid_kwh": float(max_grid)},
-            explanation=explanation,
-        )
+    # Sort items by note_index for canonical evaluation
+    sorted_items = sorted(raw_directives, key=lambda x: x.note_index)
+    canonical_list: List[DirectiveInterpretation] = []
 
-    return _make_no_op(note_index)
+    for expected_idx, item in enumerate(sorted_items):
+        idx = item.note_index
+        dtype = item.directive_type
+        applies = item.applies
+        adj = item.structured_adjustment
+        explanation = (item.explanation or "").strip() or "Interpreted directive."
+
+        if dtype not in VALID_DIRECTIVE_TYPES:
+            errors.append(f"Note [{idx}]: unsupported directive_type '{dtype}'.")
+            continue
+
+        if dtype == "no_op":
+            if applies is not False:
+                errors.append(f"Note [{idx}]: no_op directive must have applies=false, got {applies}.")
+            canonical_list.append(
+                DirectiveInterpretation(
+                    note_index=idx,
+                    applies=False,
+                    directive_type="no_op",
+                    structured_adjustment=None,
+                    explanation=explanation,
+                )
+            )
+            continue
+
+        # Applicable directives must have applies=True
+        if applies is not True:
+            errors.append(f"Note [{idx}]: directive '{dtype}' must have applies=true, got {applies}.")
+
+        if adj is None:
+            errors.append(f"Note [{idx}]: directive '{dtype}' requires structured_adjustment, but got null.")
+            continue
+
+        # Validate hours array
+        hours = adj.hours
+        if not isinstance(hours, list) or len(hours) == 0:
+            errors.append(f"Note [{idx}]: directive '{dtype}' requires non-empty hours array.")
+            continue
+
+        # Ensure hours are unique, in range 0..23, and strictly ascending
+        invalid_hours = False
+        for h in hours:
+            if not isinstance(h, int) or isinstance(h, bool) or not (0 <= h <= 23):
+                errors.append(f"Note [{idx}]: invalid hour value {h}; must be integer 0..23.")
+                invalid_hours = True
+                break
+
+        if invalid_hours:
+            continue
+
+        if len(hours) != len(set(hours)):
+            errors.append(f"Note [{idx}]: hours array contains duplicates: {hours}.")
+            continue
+
+        if hours != sorted(hours):
+            errors.append(f"Note [{idx}]: hours array must be sorted ascending: {hours}.")
+            continue
+
+        # Directive-specific adjustment validation
+        if dtype == "solar_reduction":
+            factor = adj.factor
+            if factor is None or not isinstance(factor, (int, float)) or math.isnan(factor) or math.isinf(factor):
+                errors.append(f"Note [{idx}]: solar_reduction requires finite numeric factor.")
+            elif not (0.0 <= factor <= 1.0):
+                errors.append(f"Note [{idx}]: solar_reduction factor must be in [0.0, 1.0], got {factor}.")
+            else:
+                canonical_list.append(
+                    DirectiveInterpretation(
+                        note_index=idx,
+                        applies=True,
+                        directive_type="solar_reduction",
+                        structured_adjustment={"hours": list(hours), "factor": round(float(factor), 6)},
+                        explanation=explanation,
+                    )
+                )
+
+        elif dtype == "minimum_battery_reserve":
+            reserve = adj.minimum_energy_kwh
+            if reserve is None or not isinstance(reserve, (int, float)) or math.isnan(reserve) or math.isinf(reserve):
+                errors.append(f"Note [{idx}]: minimum_battery_reserve requires finite numeric minimum_energy_kwh.")
+            elif reserve < 0.0:
+                errors.append(f"Note [{idx}]: minimum_battery_reserve must be non-negative, got {reserve}.")
+            elif reserve > battery.capacity_kwh:
+                errors.append(
+                    f"Note [{idx}]: minimum_battery_reserve ({reserve} kWh) exceeds battery capacity ({battery.capacity_kwh} kWh)."
+                )
+            else:
+                canonical_list.append(
+                    DirectiveInterpretation(
+                        note_index=idx,
+                        applies=True,
+                        directive_type="minimum_battery_reserve",
+                        structured_adjustment={"hours": list(hours), "minimum_energy_kwh": round(float(reserve), 6)},
+                        explanation=explanation,
+                    )
+                )
+
+        elif dtype == "no_charge_window":
+            canonical_list.append(
+                DirectiveInterpretation(
+                    note_index=idx,
+                    applies=True,
+                    directive_type="no_charge_window",
+                    structured_adjustment={"hours": list(hours)},
+                    explanation=explanation,
+                )
+            )
+
+        elif dtype == "no_discharge_window":
+            canonical_list.append(
+                DirectiveInterpretation(
+                    note_index=idx,
+                    applies=True,
+                    directive_type="no_discharge_window",
+                    structured_adjustment={"hours": list(hours)},
+                    explanation=explanation,
+                )
+            )
+
+        elif dtype == "max_grid_window":
+            max_grid = adj.max_grid_kwh
+            if max_grid is None or not isinstance(max_grid, (int, float)) or math.isnan(max_grid) or math.isinf(max_grid):
+                errors.append(f"Note [{idx}]: max_grid_window requires finite numeric max_grid_kwh.")
+            elif max_grid < 0.0:
+                errors.append(f"Note [{idx}]: max_grid_window max_grid_kwh must be non-negative, got {max_grid}.")
+            else:
+                canonical_list.append(
+                    DirectiveInterpretation(
+                        note_index=idx,
+                        applies=True,
+                        directive_type="max_grid_window",
+                        structured_adjustment={"hours": list(hours), "max_grid_kwh": round(float(max_grid), 6)},
+                        explanation=explanation,
+                    )
+                )
+
+    if errors or len(canonical_list) != num_notes:
+        return False, errors, []
+
+    return True, [], canonical_list
 
 
-def _clean_hours(raw: Any) -> Optional[List[int]]:
-    """Validate and normalise a raw hours list; return None on failure."""
-    if not isinstance(raw, list) or len(raw) == 0:
-        return None
-    cleaned = []
-    for h in raw:
-        if isinstance(h, int) and 0 <= h <= 23 and h not in cleaned:
-            cleaned.append(h)
-    if not cleaned:
-        return None
-    cleaned.sort()
-    return cleaned
+def _extract_raw_directives(response: Any) -> List[RawDirectiveInterpretation]:
+    """Extract list of RawDirectiveInterpretation objects from Gemini response."""
+    # 1. Direct parsed model from response.parsed
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, InterpretationsResponse):
+        return parsed.interpretations
+    if isinstance(parsed, list):
+        items: List[RawDirectiveInterpretation] = []
+        for x in parsed:
+            if isinstance(x, RawDirectiveInterpretation):
+                items.append(x)
+            else:
+                items.append(RawDirectiveInterpretation.model_validate(x))
+        return items
+
+    # 2. Text payload fallback
+    raw_text = getattr(response, "text", "") or ""
+    if raw_text:
+        try:
+            resp_obj = InterpretationsResponse.model_validate_json(raw_text)
+            return resp_obj.interpretations
+        except Exception:
+            data = json.loads(raw_text)
+            if isinstance(data, dict):
+                for k in ("interpretations", "directives", "results", "items"):
+                    if k in data and isinstance(data[k], list):
+                        return [RawDirectiveInterpretation.model_validate(x) for x in data[k]]
+            elif isinstance(data, list):
+                return [RawDirectiveInterpretation.model_validate(x) for x in data]
+
+    raise LLMProviderError("Unable to extract structured interpretations from Gemini response.")
 
 
 # ---------------------------------------------------------------------------
-# Public interface — canonical boundary for the optimizer
+# Public Interface — Canonical Boundary for the Optimizer
 # ---------------------------------------------------------------------------
 
 def interpret_operator_notes(
     operator_notes: List[str],
-    battery_context: BatterySpec,  # noqa: ARG001 — available for future use / Gemini migration
+    battery_context: BatterySpec,
 ) -> List[DirectiveInterpretation]:
     """
-    Parse operator notes via LLM and apply deterministic guardrails.
+    Parse operator notes via Google Gemini structured output and apply deterministic guardrails.
 
-    Returns one DirectiveInterpretation per note in note_index order.
-    The optimizer must never consume raw natural language; only this output.
+    Workflow:
+    1. Fast return empty list if no notes.
+    2. Format battery context and indexed notes prompt.
+    3. Call Gemini via thread-safe multi-key failover pool with structured response_schema.
+    4. Deterministically validate structure and constraints.
+    5. If validation fails and total time budget permits, attempt one bounded repair prompt.
+    6. If still invalid or provider fails, raise LLMProviderError (never silent no_op).
     """
-    if not operator_notes:
+    num_notes = len(operator_notes)
+    if num_notes == 0:
         return []
 
+    user_prompt = build_user_prompt(operator_notes, battery_context)
+
+    # 1. Primary structured generation attempt
+    response = generate_content_with_failover(
+        contents=user_prompt,
+        system_instruction=SYSTEM_INSTRUCTION,
+        response_schema=InterpretationsResponse,
+        temperature=0.0,
+    )
+
+    raw_directives = _extract_raw_directives(response)
+    is_valid, validation_errors, canonical_directives = _validate_and_canonicalize(
+        raw_directives, num_notes, battery_context
+    )
+
+    if is_valid:
+        return canonical_directives
+
+    logger.warning(
+        "Initial Gemini interpretation failed validation with %d error(s): %s; evaluating repair attempt",
+        len(validation_errors),
+        validation_errors,
+    )
+
+    # 2. Bounded repair attempt if total time budget permits
+    total_budget_sec = float(os.getenv("GEMINI_TOTAL_BUDGET_SECONDS", "25.0"))
+    # Check if we have sufficient remaining budget for a repair call
+    repair_prompt = (
+        f"{user_prompt}\n\n"
+        f"CRITICAL: The previous interpretation failed deterministic validation with these errors:\n"
+        + "\n".join(f"- {err}" for err in validation_errors)
+        + "\n\nPlease output the complete corrected interpretation fixing all listed errors strictly following the rules."
+    )
+
     try:
-        raw = _call_llm(operator_notes)
-    except Exception:
-        # LLM unavailable: all notes become no_op (safe fallback)
-        return [_make_no_op(i, "LLM unavailable; note treated as no_op.") for i in range(len(operator_notes))]
+        repair_response = generate_content_with_failover(
+            contents=repair_prompt,
+            system_instruction=SYSTEM_INSTRUCTION,
+            response_schema=InterpretationsResponse,
+            temperature=0.0,
+        )
+        repair_raw = _extract_raw_directives(repair_response)
+        rep_valid, rep_errors, rep_canonical = _validate_and_canonicalize(
+            repair_raw, num_notes, battery_context
+        )
+        if rep_valid:
+            logger.info("Gemini repair attempt succeeded in resolving validation errors.")
+            return rep_canonical
 
-    if not isinstance(raw, list):
-        return [_make_no_op(i, "LLM returned non-list; treated as no_op.") for i in range(len(operator_notes))]
+        logger.error("Gemini repair attempt also failed validation: %s", rep_errors)
+        raise LLMProviderError(
+            f"Directive interpretation validation failed after repair attempt: {'; '.join(rep_errors)}"
+        )
 
-    result: List[DirectiveInterpretation] = []
-    for i in range(len(operator_notes)):
-        item = raw[i] if i < len(raw) else {}
-        if not isinstance(item, dict):
-            result.append(_make_no_op(i))
-        else:
-            result.append(_guardrail(item, i))
-
-    return result
+    except LLMProviderError:
+        raise
+    except Exception as exc:
+        raise LLMProviderError(
+            f"Directive interpretation failed validation: {'; '.join(validation_errors)}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
-# Legacy compatibility shim (used by old tests/callers if any)
+# Legacy Compatibility Shim
 # ---------------------------------------------------------------------------
 
 def parse_and_guardrail_notes(
     notes: List[str],
     battery_context: Optional[BatterySpec] = None,
 ) -> List[DirectiveInterpretation]:
-    """Deprecated shim — prefer interpret_operator_notes."""
-    from app.models import BatterySpec as BS
-
-    dummy_battery = battery_context or BS(
-        capacity_kwh=0,
-        initial_energy_kwh=0,
-        minimum_energy_kwh=0,
-        max_charge_kwh_per_hour=0,
-        max_discharge_kwh_per_hour=0,
+    """Deprecated shim for compatibility with legacy test invocations."""
+    dummy_battery = battery_context or BatterySpec(
+        capacity_kwh=200.0,
+        initial_energy_kwh=100.0,
+        minimum_energy_kwh=20.0,
+        max_charge_kwh_per_hour=50.0,
+        max_discharge_kwh_per_hour=50.0,
     )
     return interpret_operator_notes(notes, dummy_battery)

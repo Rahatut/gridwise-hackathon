@@ -38,10 +38,12 @@ POST /optimize-energy
 
 ## Environment Variables
 
-| Variable | Required | Default | Description |
-| --- | --- | --- | --- |
-| `OPENAI_API_KEY` | Yes | — | OpenAI API key for LLM directive interpretation |
-| `OPENAI_MODEL` | No | `gpt-4o-mini` | Model identifier used for structured extraction |
+| `GEMINI_API_KEYS` | Yes* | — | Comma-separated Gemini API keys for failover |
+| `GEMINI_API_KEY` | Yes* | — | Single-key fallback if `GEMINI_API_KEYS` unset |
+| `GEMINI_MODEL` | No | `gemini-2.5-flash` | Gemini model for structured directive interpretation |
+| `GEMINI_REQUEST_TIMEOUT_SECONDS` | No | `8.0` | Per-request timeout in seconds |
+| `GEMINI_TOTAL_BUDGET_SECONDS` | No | `25.0` | Total time budget for Gemini calls including failover |
+| `GEMINI_KEY_COOLDOWN_SECONDS` | No | `60.0` | Cooldown duration for rate-limited (429) keys |
 
 ## Local Setup
 
@@ -128,9 +130,10 @@ curl -X POST http://127.0.0.1:8000/optimize-energy \
 
 ## LLM
 
-- **Model:** `gpt-4o-mini` (configurable via `OPENAI_MODEL`)
-- **Prompt version:** v1 — canonical directive schema with 6 supported types
-- **Role:** Semantic parser only; never trusts free-form output
+- **Model:** `gemini-2.5-flash` (configurable via `GEMINI_MODEL`)
+- **SDK:** Official Google GenAI SDK (`google-genai`)
+- **Structured Output:** Pydantic response schema with strict deterministic guardrails
+- **Failover:** Thread-safe multi-key pool with cooldown and transient error retry
 
 ## Optimizer
 
@@ -153,13 +156,12 @@ Image binds to `0.0.0.0:8000`. No baked-in credentials.
 # Health check
 curl http://127.0.0.1:8000/health
 
-# Full audit (energy balance, battery bounds, neutrality, totals)
-python3 /tmp/audit.py
+# Run test suite
+python -m pytest tests/ -v
 ```
 
 ## Limitations
 
-- Simultaneous charge/discharge is not explicitly forbidden (LP may set both to zero in optimal solutions)
-- LLM interpretation is probabilistic; guardrails reject malformed outputs as `no_op`
-- Requires `OPENAI_API_KEY` for directive interpretation; falls back to `no_op` if unavailable
+- Simultaneous charge/discharge is not explicitly forbidden (LP naturally sets both to zero in optimal solutions)
+- LLM interpretation uses structured output + deterministic guardrails; malformed outputs trigger a bounded repair before controlled failure
 - End-of-day neutrality enforced via explicit LP equality constraint
