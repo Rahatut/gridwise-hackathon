@@ -244,3 +244,36 @@ docker run -d -p 8000:8000 --env-file .env gridwise-service
 ```
 
 Image binds to `0.0.0.0:8000`. Health check will respond at `http://localhost:8000/health`.
+
+## Demo Dashboard (Operator Control Room)
+
+An interactive, presentation-ready web dashboard is provided for live judging demonstrations:
+
+### Run Locally
+
+1. Start the GridWise backend:
+   ```bash
+   python -m uvicorn app.main:app --port 8000
+   ```
+2. Open your browser:
+   ```
+   http://localhost:8000/demo
+   ```
+
+### Features
+
+- **Realistic Scenario Presets**: 5 one-click operational presets (*Emergency Battery Reserve*, *Solar Maintenance*, *Peak Grid Restriction*, *Battery Maintenance*, *Mixed Operations*).
+- **Live Gemini Interpretation**: Visual directive cards with status badges (`[APPLIED]` vs `[IGNORED] no_op`), affected hours, numerical parameter extractions, and operator explanations.
+- **Interactive 24-Hour Energy Charts**: Clean Recharts curves showing Demand, Solar Used, Grid Import, Tariff, and highlighted directive restriction windows.
+- **Battery Strategy & Arbitrage**: State of Charge (SoC) trajectory curve, bidirectional charge/discharge bars, and end-of-day neutrality verification (`NEUTRALITY VERIFIED ✓`).
+- **System Validation Display**: 8-point automated response consistency verification (`ALL CONSTRAINTS VALID`).
+- **Technical JSON Inspector**: Collapsible tabs showing the exact canonical `REQUEST JSON` and `RESPONSE JSON` with copy-to-clipboard functionality to demonstrate that the dashboard utilizes the exact judging API.
+
+### Independent Frontend Deployment (Vercel / Netlify / Render)
+
+The frontend source code is kept completely independent in `demo-ui/` (React + Vite + Tailwind CSS):
+- **Development**: `cd demo-ui && npm run dev`
+- **Build**: `cd demo-ui && npm run build` (outputs to `static/demo/`)
+- **Independent Hosting**: If deploying the frontend to Vercel/Netlify and the backend to Render/Railway:
+  - Set `VITE_API_BASE_URL=https://your-backend.onrender.com` in `demo-ui/.env` (or configure it dynamically via the in-app Settings gear icon in the dashboard header).
+  - CORS is already pre-configured on the backend to allow cross-origin requests.
