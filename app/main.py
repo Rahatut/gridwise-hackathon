@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 import os
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 
 app = FastAPI(title="GridWise Energy Optimiser")
 
@@ -53,8 +53,12 @@ if os.path.exists(_STATIC_DEMO_DIR):
     _assets_dir = os.path.join(_STATIC_DEMO_DIR, "assets")
     if os.path.exists(_assets_dir):
         app.mount("/demo/assets", StaticFiles(directory=_assets_dir), name="demo-assets")
+        app.mount("/assets", StaticFiles(directory=_assets_dir), name="root-assets")
 
     @app.get("/demo", include_in_schema=False)
+    def redirect_demo():
+        return RedirectResponse(url="/demo/")
+
     @app.get("/demo/", include_in_schema=False)
     def serve_demo_dashboard():
         index_file = os.path.join(_STATIC_DEMO_DIR, "index.html")
