@@ -138,6 +138,10 @@ def run_energy_optimization(scenario: Dict[str, Any], directives: List[Dict[str,
         discharge = result.x[3 * n:4 * n]
 
     # --- Post-solve audit ---
+    def clean(val: float) -> float:
+        v = round(float(val), 6)
+        return 0.0 if abs(v) < 1e-6 else v
+
     schedule = []
     soc_prev = initial_energy
     for h in range(n):
@@ -145,19 +149,19 @@ def run_energy_optimization(scenario: Dict[str, Any], directives: List[Dict[str,
         # Clamp for numerical safety (should already be within bounds)
         soc_after = max(min_reserve, min(battery_capacity, soc_after))
         schedule.append({
-            "hour": h,
-            "grid_kwh": round(float(grid[h]), 6),
-            "solar_used_kwh": round(float(solar_used[h]), 6),
-            "solar_curtailed_kwh": round(float(max(0.0, effective_solar[h] - solar_used[h])), 6),
-            "battery_charge_kwh": round(float(charge[h]), 6),
-            "battery_discharge_kwh": round(float(discharge[h]), 6),
-            "battery_soc_kwh": round(float(soc_after), 6),
+            "hour": int(h),
+            "grid_kwh": clean(grid[h]),
+            "solar_used_kwh": clean(solar_used[h]),
+            "solar_curtailed_kwh": clean(max(0.0, effective_solar[h] - solar_used[h])),
+            "battery_charge_kwh": clean(charge[h]),
+            "battery_discharge_kwh": clean(discharge[h]),
+            "battery_soc_kwh": clean(soc_after),
         })
         soc_prev = soc_after
 
-    total_grid = round(float(np.sum(grid)), 6)
-    total_cost = round(float(np.sum(grid * tariff)), 6)
-    peak_grid = round(float(np.max(grid)), 6)
+    total_grid = clean(np.sum(grid))
+    total_cost = clean(np.sum(grid * tariff))
+    peak_grid = clean(np.max(grid))
 
     return {
         "total_grid_kwh": total_grid,

@@ -33,4 +33,4 @@ class OptimizeResponse(BaseModel):
     total_grid_kwh: float
     total_cost_bdt: float
     peak_grid_kwh: float
-    schedule: List[Dict[str, float]]
+    schedule: List[Dict[str, Any]]

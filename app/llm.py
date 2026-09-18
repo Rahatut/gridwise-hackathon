@@ -23,7 +23,7 @@ Rules:
 - If it applies, set applies=true and include the structured_adjustment.
 - Time windows must be unique integers 0-23 in ascending order.
 - Solar factor is the usable fraction remaining (e.g., 80% reduction -> factor=0.2).
-- Return ONLY valid JSON: an array of objects with keys: note_index, type, applies, structured_adjustment.
+- Return ONLY valid JSON object: {"directives": [{"note_index": <int>, "type": <str>, "applies": <bool>, "structured_adjustment": <dict or null>}, ...]}
 """
 
 
@@ -42,6 +42,7 @@ def _call_llm(notes: List[str]) -> List[Dict[str, Any]]:
 
     payload = [{"note_index": i, "note": n} for i, n in enumerate(notes)]
     user_content = json.dumps(payload)
+    max_tokens = int(os.getenv("OPENAI_MAX_TOKENS", "400"))
 
     resp = client.chat.completions.create(
         model=model,
@@ -51,16 +52,21 @@ def _call_llm(notes: List[str]) -> List[Dict[str, Any]]:
         ],
         response_format={"type": "json_object"},
         temperature=0.0,
+        max_tokens=max_tokens,
         timeout=25,
     )
 
     raw = resp.choices[0].message.content
     parsed = json.loads(raw)
     if isinstance(parsed, dict):
-        for key in ("directives", "results", "items"):
+        for key in ("directives", "results", "result", "items", "data"):
             if key in parsed and isinstance(parsed[key], list):
-                parsed = parsed[key]
-                break
+                return parsed[key]
+        for val in parsed.values():
+            if isinstance(val, list):
+                return val
+        if "type" in parsed or "note_index" in parsed:
+            return [parsed]
     return parsed
 
 
@@ -156,7 +162,8 @@ def parse_and_guardrail_notes(notes: List[str]) -> List[Dict[str, Any]]:
 
     try:
         raw = _call_llm(notes)
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] LLM directive parsing failed: {e}")
         return [_no_op(i) for i in range(len(notes))]
 
     if not isinstance(raw, list):
