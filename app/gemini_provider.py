@@ -215,6 +215,7 @@ def generate_content_with_failover(
     temperature: float = 0.0,
     model: Optional[str] = None,
     pool: Optional[GeminiKeyPool] = None,
+    deadline: Optional[float] = None,
 ) -> Any:
     """
     Execute a Gemini generate_content call with robust multi-key failover and
@@ -226,16 +227,23 @@ def generate_content_with_failover(
     - 400 / INVALID_ARGUMENT: raise LLMProviderError immediately (client error, not fixed by key rotation)
     - 503 / UNAVAILABLE / temporary 5xx / timeout: short cooldown, failover if budget permits
     - Total time budget exceeded: raise LLMProviderError
+
+    Args:
+        deadline: Optional monotonic clock deadline (time.monotonic() value). If provided,
+            the total budget is measured from NOW until deadline instead of a fresh window.
+            Use this to share a single wall-clock budget across multiple sequential calls
+            (e.g., initial interpretation + bounded repair) to stay within the 30s hard limit.
     """
     model_name = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     target_pool = pool or get_pool()
 
-    req_timeout_sec = float(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "8.0"))
+    req_timeout_sec = float(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "15.0"))
     total_budget_sec = float(os.getenv("GEMINI_TOTAL_BUDGET_SECONDS", "25.0"))
     cooldown_sec = float(os.getenv("GEMINI_KEY_COOLDOWN_SECONDS", "60.0"))
 
-    start_time = time.monotonic()
-    deadline = start_time + total_budget_sec
+    # Use shared deadline if provided; otherwise start a fresh budget from now.
+    if deadline is None:
+        deadline = time.monotonic() + total_budget_sec
 
     excluded_ids: set[str] = set()
     last_error: Optional[Exception] = None
@@ -255,8 +263,9 @@ def generate_content_with_failover(
             clean_msg = _sanitize_message(str(pool_err), all_known_keys)
             raise LLMProviderError(clean_msg) from pool_err
 
-        # Cap the single-request timeout to the remaining total budget
-        per_call_timeout = min(req_timeout_sec, remaining_budget)
+        # Cap the single-request timeout to the remaining total budget,
+        # but enforce the Gemini SDK minimum of 10 seconds.
+        per_call_timeout = max(10.0, min(req_timeout_sec, remaining_budget))
         http_opts = types.HttpOptions(
             timeout=int(per_call_timeout * 1000),
             retry_options=types.HttpRetryOptions(attempts=1),

@@ -473,6 +473,55 @@ def test_empty_notes_returns_empty_list_immediately(sample_battery: BatterySpec)
         mock_call.assert_not_called()
 
 
+def test_repair_uses_shared_deadline(sample_battery: BatterySpec):
+    """
+    Verify that the repair call shares the SAME deadline as the initial call.
+    The shared_deadline must be passed to BOTH generate_content_with_failover calls
+    so that initial + repair cannot collectively exceed GEMINI_TOTAL_BUDGET_SECONDS.
+    """
+    notes = ["Keep at least 50% of battery from 6 PM to 9 PM."]
+    # Bad first response: wrong count -> validation fails -> triggers repair
+    bad_resp = MagicMock()
+    bad_resp.parsed = InterpretationsResponse(interpretations=[])  # 0 items instead of 1
+
+    good_resp = MagicMock()
+    good_resp.parsed = InterpretationsResponse(
+        interpretations=[
+            RawDirectiveInterpretation(
+                note_index=0,
+                applies=True,
+                directive_type="minimum_battery_reserve",
+                structured_adjustment=StructuredAdjustment(
+                    hours=[18, 19, 20], minimum_energy_kwh=100.0
+                ),
+                explanation="50% of 200 kWh",
+            )
+        ]
+    )
+
+    captured_deadlines = []
+
+    def capturing_call(*args, **kwargs):
+        captured_deadlines.append(kwargs.get("deadline"))
+        if len(captured_deadlines) == 1:
+            return bad_resp
+        return good_resp
+
+    with patch("app.llm.generate_content_with_failover", side_effect=capturing_call):
+        result = interpret_operator_notes(notes, sample_battery)
+
+    assert len(result) == 1
+    assert result[0].directive_type == "minimum_battery_reserve"
+    # Both calls must share the SAME deadline value
+    assert len(captured_deadlines) == 2, f"Expected 2 calls, got {len(captured_deadlines)}"
+    assert captured_deadlines[0] is not None, "Initial call must have a deadline"
+    assert captured_deadlines[1] is not None, "Repair call must have a deadline"
+    assert captured_deadlines[0] == captured_deadlines[1], (
+        f"Repair call must reuse the same deadline as initial call. "
+        f"Got {captured_deadlines[0]} vs {captured_deadlines[1]}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Optional Live Smoke Test (Only runs if a real key is present in environment)
 # ---------------------------------------------------------------------------

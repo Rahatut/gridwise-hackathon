@@ -387,12 +387,18 @@ def interpret_operator_notes(
 
     user_prompt = build_user_prompt(operator_notes, battery_context)
 
+    # Record start time here; share a single wall-clock deadline across the initial
+    # call and any repair attempt so total latency stays within the 30s hard limit.
+    total_budget_sec = float(os.getenv("GEMINI_TOTAL_BUDGET_SECONDS", "25.0"))
+    shared_deadline = time.monotonic() + total_budget_sec
+
     # 1. Primary structured generation attempt
     response = generate_content_with_failover(
         contents=user_prompt,
         system_instruction=SYSTEM_INSTRUCTION,
         response_schema=InterpretationsResponse,
         temperature=0.0,
+        deadline=shared_deadline,
     )
 
     raw_directives = _extract_raw_directives(response)
@@ -409,9 +415,8 @@ def interpret_operator_notes(
         validation_errors,
     )
 
-    # 2. Bounded repair attempt if total time budget permits
-    total_budget_sec = float(os.getenv("GEMINI_TOTAL_BUDGET_SECONDS", "25.0"))
-    # Check if we have sufficient remaining budget for a repair call
+    # 2. Bounded repair attempt — use remaining budget from the SAME shared_deadline
+    #    so that initial + repair combined cannot exceed the configured total budget.
     repair_prompt = (
         f"{user_prompt}\n\n"
         f"CRITICAL: The previous interpretation failed deterministic validation with these errors:\n"
@@ -425,6 +430,7 @@ def interpret_operator_notes(
             system_instruction=SYSTEM_INSTRUCTION,
             response_schema=InterpretationsResponse,
             temperature=0.0,
+            deadline=shared_deadline,
         )
         repair_raw = _extract_raw_directives(repair_response)
         rep_valid, rep_errors, rep_canonical = _validate_and_canonicalize(

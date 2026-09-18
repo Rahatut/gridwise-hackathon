@@ -38,12 +38,16 @@ POST /optimize-energy
 
 ## Environment Variables
 
+| Variable | Required | Default | Description |
+|---|---|---|---|
 | `GEMINI_API_KEYS` | Yes* | — | Comma-separated Gemini API keys for failover |
 | `GEMINI_API_KEY` | Yes* | — | Single-key fallback if `GEMINI_API_KEYS` unset |
 | `GEMINI_MODEL` | No | `gemini-2.5-flash` | Gemini model for structured directive interpretation |
-| `GEMINI_REQUEST_TIMEOUT_SECONDS` | No | `8.0` | Per-request timeout in seconds |
-| `GEMINI_TOTAL_BUDGET_SECONDS` | No | `25.0` | Total time budget for Gemini calls including failover |
+| `GEMINI_REQUEST_TIMEOUT_SECONDS` | No | `15.0` | Per-request timeout in seconds (Gemini SDK enforces ≥ 10s) |
+| `GEMINI_TOTAL_BUDGET_SECONDS` | No | `25.0` | Shared time budget across initial + repair Gemini calls |
 | `GEMINI_KEY_COOLDOWN_SECONDS` | No | `60.0` | Cooldown duration for rate-limited (429) keys |
+
+> **Important — Gemini Quota:** Google Gemini API rate limits (RPM / TPM / RPD) are enforced per **Google Cloud / AI Studio project**, not per individual API key. Multiple API keys generated within the same project share the same quota. For genuine parallel failover capacity, use keys from **independent projects**. This pool provides reliable failover and cooldown handling, not quota multiplication within a single project.
 
 ## Local Setup
 
