@@ -34,6 +34,7 @@ POST /optimize-energy
 ## Requirements
 
 - Python 3.11+
+- Node.js 18+ (for frontend)
 - Docker (optional, for containerized deployment)
 
 ## Environment Variables
@@ -51,6 +52,8 @@ POST /optimize-energy
 
 ## Local Setup
 
+### Backend (Python)
+
 ```bash
 cp .env.example .env
 python -m venv venv
@@ -58,13 +61,38 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+### Frontend (Node.js)
+
+```bash
+cd demo-ui
+npm install
+```
+
 ## Run
+
+### Backend
 
 ```bash
 uvicorn app.main:app --reload --port 8000
 ```
 
 Service will be available at `http://127.0.0.1:8000`.
+
+### Frontend (Dev Server)
+
+```bash
+cd demo-ui && npm run dev
+```
+
+Frontend will be available at `http://localhost:3000`. The Vite dev server proxies `/optimize-energy` and `/health` to `http://127.0.0.1:8000`.
+
+### Frontend (Production Preview)
+
+```bash
+cd demo-ui && npm run build && npm run preview
+```
+
+Preview will be available at `http://localhost:4173`.
 
 ## API Specification
 
@@ -236,7 +264,9 @@ SUMMARY RESULTS:
 
 ## Docker Containerization
 
-To build and run in Docker:
+### Backend
+
+The Dockerfile in the project root builds and runs the backend service:
 
 ```bash
 docker build -t gridwise-service .
@@ -245,9 +275,26 @@ docker run -d -p 8000:8000 --env-file .env gridwise-service
 
 Image binds to `0.0.0.0:8000`. Health check will respond at `http://localhost:8000/health`.
 
+The backend Dockerfile includes:
+- Python 3.11-slim base image
+- All dependencies from `requirements.txt`
+- Uvicorn server serving `app.main:app` on port 8000
+
+### Frontend
+
+The frontend is deployed via **GitHub Pages** using the GitHub Actions workflow at `.github/workflows/deploy-frontend.yml`. No Docker is needed for the frontend.
+
+To build the frontend locally for testing:
+
+```bash
+cd demo-ui && npm run build
+```
+
+The built static files are output to `demo-ui/dist/` and can be served by any static file server (e.g., `npm run preview` on port 4173).
+
 ## Demo Dashboard (Operator Control Room)
 
-An interactive, presentation-ready web dashboard is provided for live judging demonstrations:
+An interactive, presentation-ready web dashboard is provided for live judging demonstrations.
 
 ### Run Locally
 
@@ -255,10 +302,16 @@ An interactive, presentation-ready web dashboard is provided for live judging de
    ```bash
    python -m uvicorn app.main:app --port 8000
    ```
-2. Open your browser:
+2. Start the frontend dev server:
+   ```bash
+   cd demo-ui && npm run dev
    ```
-   http://localhost:8000/demo
+3. Open your browser:
    ```
+   http://localhost:3000
+   ```
+
+The frontend proxies API calls to the backend at `http://127.0.0.1:8000` via the Vite dev server proxy configured in `demo-ui/vite.config.ts`.
 
 ### Features
 
@@ -269,11 +322,27 @@ An interactive, presentation-ready web dashboard is provided for live judging de
 - **System Validation Display**: 8-point automated response consistency verification (`ALL CONSTRAINTS VALID`).
 - **Technical JSON Inspector**: Collapsible tabs showing the exact canonical `REQUEST JSON` and `RESPONSE JSON` with copy-to-clipboard functionality to demonstrate that the dashboard utilizes the exact judging API.
 
-### Independent Frontend Deployment (Vercel / Netlify / Render)
+### Frontend Architecture
 
 The frontend source code is kept completely independent in `demo-ui/` (React + Vite + Tailwind CSS):
+
 - **Development**: `cd demo-ui && npm run dev`
-- **Build**: `cd demo-ui && npm run build` (outputs to `static/demo/`)
-- **Independent Hosting**: If deploying the frontend to Vercel/Netlify and the backend to Render/Railway:
-  - Set `VITE_API_BASE_URL=https://your-backend.onrender.com` in `demo-ui/.env` (or configure it dynamically via the in-app Settings gear icon in the dashboard header).
-  - CORS is already pre-configured on the backend to allow cross-origin requests.
+- **Build**: `cd demo-ui && npm run build` (outputs to `demo-ui/dist/`)
+- **API Configuration**: The backend URL is set via the `VITE_API_BASE_URL` environment variable in `demo-ui/.env`. By default it falls back to `https://gridwise-hackathon.onrender.com`.
+
+### Deploy to GitHub Pages
+
+A GitHub Actions workflow (`.github/workflows/deploy-frontend.yml`) automatically builds and deploys the frontend to GitHub Pages on every push to `main`:
+
+```yaml
+# The workflow:
+# 1. Installs npm dependencies
+# 2. Builds the frontend with VITE_API_BASE_URL set from GitHub Secrets or default
+# 3. Deploys the built static files to GitHub Pages
+```
+
+To configure a custom backend URL for the deployed frontend, add a GitHub Secret named `VITE_API_BASE_URL` in the repository settings.
+
+### Backend Deployment (Render)
+
+The backend is deployed on Render at `https://gridwise-hackathon.onrender.com`. CORS is pre-configured to allow cross-origin requests from any origin.
