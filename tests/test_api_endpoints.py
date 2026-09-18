@@ -61,6 +61,14 @@ def test_health_check(client: TestClient):
     assert data == {"status": "ok"}
 
 
+def test_demo_endpoint_serves_html(client: TestClient):
+    """GET /demo must return HTTP 200 with HTML content when static build exists."""
+    resp = client.get("/demo")
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers.get("content-type", "")
+    assert "GridWise" in resp.text
+
+
 # ---------------------------------------------------------------------------
 # POST /optimize-energy Status Code Tests
 # ---------------------------------------------------------------------------
