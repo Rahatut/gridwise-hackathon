@@ -35,13 +35,25 @@ app = FastAPI(title="GridWise Energy Optimiser")
 
 
 # ---------------------------------------------------------------------------
-# Custom 400 handler for malformed JSON
+# Custom handlers for malformed JSON (400) and general exceptions (500)
 # ---------------------------------------------------------------------------
+
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # Malformed JSON (syntax/decode error) -> controlled HTTP 400
+    for error in exc.errors():
+        if error.get("type") in ("json_invalid", "model_attributes_type") or "JSON decode error" in error.get("msg", ""):
+            return JSONResponse(status_code=400, content={"detail": "Malformed JSON in request body"})
+    # Semantically invalid well-formed request -> HTTP 422
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
+
 
 @app.exception_handler(Exception)
 async def _generic_handler(request: Request, exc: Exception) -> JSONResponse:
-    # Let FastAPI's built-in validation errors (422) propagate normally;
-    # only catch truly unexpected errors here.
     logger.exception("Unhandled exception in %s", request.url.path)
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 

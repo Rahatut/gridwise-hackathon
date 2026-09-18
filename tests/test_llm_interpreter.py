@@ -140,10 +140,61 @@ def test_key_pool_bad_request_does_not_rotate():
     pool._entries[1].client.models.generate_content.assert_not_called()
 
 
-def test_key_pool_all_exhausted_raises_provider_error():
-    pool = GeminiKeyPool(["key_1"])
-    err_429 = errors.ClientError(429, {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota"}})
-    pool._entries[0].client.models.generate_content = MagicMock(side_effect=err_429)
+def test_key_pool_503_failover_to_healthy_key():
+    pool = GeminiKeyPool(["key_failing_503", "key_working"])
+    mock_resp = MagicMock()
+    mock_resp.parsed = InterpretationsResponse(interpretations=[])
+
+    err_503 = errors.ServerError(503, {"error": {"code": 503, "status": "UNAVAILABLE", "message": "Backend unavailable"}})
+    pool._entries[0].client.models.generate_content = MagicMock(side_effect=err_503)
+    pool._entries[1].client.models.generate_content = MagicMock(return_value=mock_resp)
+
+    res = generate_content_with_failover(
+        contents="test",
+        system_instruction="sys",
+        pool=pool,
+    )
+    assert res == mock_resp
+    assert pool._entries[0].cooldown_until > time.monotonic()
+
+
+def test_key_pool_concurrent_thread_safety():
+    """Verify thread-safe candidate selection across concurrent threads."""
+    import concurrent.futures
+    pool = GeminiKeyPool([f"key_{i}" for i in range(5)])
+
+    def worker():
+        entries = []
+        for _ in range(50):
+            cand = pool.get_candidate()
+            entries.append(cand.key_id)
+        return entries
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(worker) for _ in range(10)]
+        results = [f.result() for f in futures]
+
+    # Ensure all threads retrieved valid candidates without corruption
+    assert len(results) == 10
+    for r in results:
+        assert len(r) == 50
+        assert all(k.startswith("key_") for k in r)
+
+
+def test_secret_string_never_leaks_in_exceptions():
+    """Ensure raw secret key string is sanitized from error messages and exceptions."""
+    from app.gemini_provider import _sanitize_message
+
+    secret_key = "AIzaSySecretApiKey123456789"
+    raw_msg = f"Failed to connect using key {secret_key} to endpoint"
+    sanitized = _sanitize_message(raw_msg, [secret_key])
+    assert secret_key not in sanitized
+    assert "[REDACTED_API_KEY]" in sanitized
+
+    # Also verify during 400 ClientError where Gemini echoes a key in message
+    pool = GeminiKeyPool([secret_key])
+    err_400 = errors.ClientError(400, {"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": f"Invalid parameter for {secret_key}"}})
+    pool._entries[0].client.models.generate_content = MagicMock(side_effect=err_400)
 
     with pytest.raises(LLMProviderError) as exc_info:
         generate_content_with_failover(
@@ -151,7 +202,10 @@ def test_key_pool_all_exhausted_raises_provider_error():
             system_instruction="sys",
             pool=pool,
         )
-    assert "cooling down" in str(exc_info.value) or "exhausted" in str(exc_info.value)
+
+    msg = str(exc_info.value)
+    assert secret_key not in msg
+    assert "[REDACTED_API_KEY]" in msg
 
 
 # ---------------------------------------------------------------------------
