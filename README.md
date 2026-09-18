@@ -236,14 +236,36 @@ SUMMARY RESULTS:
 
 ## Docker Containerization
 
-To build and run in Docker:
+### Option A: 1-Command Startup with Docker Compose (Recommended)
 
 ```bash
-docker build -t gridwise-service .
-docker run -d -p 8000:8000 --env-file .env gridwise-service
+docker compose up --build
 ```
 
-Image binds to `0.0.0.0:8000`. Health check will respond at `http://localhost:8000/health`.
+This starts the unified service on port 8000, loads `.env`, configures health checks, and mounts the interactive demo at `http://localhost:8000/demo`.
+
+### Option B: Docker CLI
+
+```bash
+# Build the production image
+docker build -t gridwise-service .
+
+# Run with your environment file
+docker run -d -p 8000:8000 --env-file .env --name gridwise gridwise-service
+```
+
+- **Health check**: `http://localhost:8000/health` (built-in container healthcheck)
+- **Interactive Demo**: `http://localhost:8000/demo/`
+- **Dynamic PORT**: Automatically binds to cloud-assigned `$PORT` (Render, Railway, Fly.io)
+
+### Option C: Independent Frontend Deployment
+
+If you prefer to deploy the frontend as a standalone Nginx container:
+```bash
+# Build and run the standalone frontend container
+docker build -t gridwise-demo-ui ./demo-ui
+docker run -d -p 3000:80 gridwise-demo-ui
+```
 
 ## Demo Dashboard (Operator Control Room)
 

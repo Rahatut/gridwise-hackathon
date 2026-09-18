@@ -6,3 +6,8 @@ __pycache__
 *.pyo
 *.pyd
 .pytest_cache
+venv/
+node_modules/
+demo-ui/node_modules/
+demo-ui/dist/
+.DS_Store
