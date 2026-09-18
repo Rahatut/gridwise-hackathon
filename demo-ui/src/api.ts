@@ -1,29 +1,14 @@
 import { OptimizeRequest, OptimizeResponse } from './types';
 
-const STORAGE_KEY = 'gridwise_custom_api_url';
+// Backend API base URL from Vite environment variable, with fallback to Render URL
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'https://gridwise-hackathon.onrender.com';
 
 export function getApiBaseUrl(): string {
-  if (typeof window !== 'undefined') {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved !== null && saved.trim() !== '') {
-      return saved.trim().replace(/\/+$/, '');
-    }
-  }
-  const envUrl = import.meta.env.VITE_API_BASE_URL;
-  if (envUrl && typeof envUrl === 'string' && envUrl.trim() !== '') {
-    return envUrl.trim().replace(/\/+$/, '');
-  }
-  return ''; // Relative path by default
+  return API_BASE_URL.replace(/\/+$/, '');
 }
 
-export function setApiBaseUrl(url: string): void {
-  if (typeof window !== 'undefined') {
-    if (!url || url.trim() === '') {
-      localStorage.removeItem(STORAGE_KEY);
-    } else {
-      localStorage.setItem(STORAGE_KEY, url.trim().replace(/\/+$/, ''));
-    }
-  }
+export function setApiBaseUrl(_url: string): void {
+  // No-op: API URL is configured via VITE_API_BASE_URL environment variable
 }
 
 export async function checkHealth(signal?: AbortSignal): Promise<{ status: string }> {
@@ -33,7 +18,7 @@ export async function checkHealth(signal?: AbortSignal): Promise<{ status: strin
   if (!res.ok) {
     throw new Error(`Health check failed with HTTP ${res.status}`);
   }
-  return res.json();
+  return await res.json();
 }
 
 export async function optimizeEnergy(
@@ -56,7 +41,6 @@ export async function optimizeEnergy(
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
-
     if (!res.ok) {
       let detail = `Server returned HTTP ${res.status}`;
       try {
@@ -71,7 +55,6 @@ export async function optimizeEnergy(
       }
       throw new Error(detail);
     }
-
     return await res.json();
   } catch (err: any) {
     if (err.name === 'AbortError') {

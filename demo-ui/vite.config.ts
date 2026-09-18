@@ -7,7 +7,7 @@ export default defineConfig({
   // Use relative base so assets load correctly whether served at /demo/ or on root domain
   base: './',
   build: {
-    outDir: '../static/demo',
+    outDir: 'dist',
     emptyOutDir: true,
   },
   server: {

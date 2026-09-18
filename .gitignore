@@ -10,3 +10,4 @@ build/
 node_modules/
 demo-ui/node_modules/
 demo-ui/dist/
+demo-ui/.env
