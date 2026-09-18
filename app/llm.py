@@ -2,6 +2,9 @@ import os
 import json
 from typing import List, Dict, Any
 from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 SYSTEM_PROMPT = """You are an energy operator directive parser for a 24-hour battery scheduling system.
@@ -29,8 +32,13 @@ def _call_llm(notes: List[str]) -> List[Dict[str, Any]]:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set")
 
-    client = OpenAI(api_key=api_key)
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    # Support OpenRouter keys (sk-or-v1-...) and direct OpenAI keys
+    if api_key.startswith("sk-or-v1-"):
+        client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
+        model = os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini")
+    else:
+        client = OpenAI(api_key=api_key)
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     payload = [{"note_index": i, "note": n} for i, n in enumerate(notes)]
     user_content = json.dumps(payload)
